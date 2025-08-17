@@ -1,0 +1,39 @@
+// For format details, see https://aka.ms/devcontainer.json. For config options, see the
+// README at: https://github.com/devcontainers/templates/tree/main/src/python
+{
+	"name": "NVIDIA JAX Dev",
+	"build": {
+		"context": "..",
+		"dockerfile": "Dockerfile"
+	},
+	"runArgs": [
+		"--gpus",
+		"all",
+		"-e",
+		"XLA_PYTHON_CLIENT_PREALLOCATE=false"
+	],
+	"workspaceFolder": "/workspace",
+	"mounts": [
+		"source=${localWorkspaceFolder},target=/workspace,type=bind"
+	],
+	// Create venv once, then install project deps if present
+	"postCreateCommand": "bash -lc 'python -m venv /workspace/.venv --system-site-packages && /workspace/.venv/bin/python -m pip install -U pip && /workspace/.venv/bin/pip install -r /workspace/requirements.txt'",
+	"customizations": {
+		"vscode": {
+			"extensions": [
+				"ms-python.python",
+				"ms-python.vscode-pylance",
+				"ms-toolsai.jupyter"
+			],
+			"settings": {
+				"python.defaultInterpreterPath": "/workspace/.venv/bin/python",
+				"python.terminal.activateEnvironment": true
+			}
+		}
+	},
+	"forwardPorts": [
+		8888
+	]
+	// Start command (optional; here’s a Jupyter example you can uncomment if needed)
+	// "postStartCommand": "jupyter lab --ip=0.0.0.0 --port=8888 --no-browser --allow-root"
+}

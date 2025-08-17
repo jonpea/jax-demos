@@ -1,0 +1,10 @@
+equinox
+ipython
+mypy
+pytest
+ruff
+
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch
+torchdata
+torchvision
