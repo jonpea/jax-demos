@@ -1,10 +1,10 @@
+datasets[vision]
 equinox
 ipython
 mypy
+numpy
+optax
+orbax-checkpoint==0.5.3
+pillow
 pytest
 ruff
-
---extra-index-url https://download.pytorch.org/whl/cpu
-torch
-torchdata
-torchvision

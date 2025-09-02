@@ -1,22 +1,11 @@
 # jax-demos
 
-## Activation 
-
-### Outside of vscode
-
-```bash
-docker run --rm -it --gpus all `
-    -v "${PWD}:/workspace" -w /workspace `
-    -e XLA_PYTHON_CLIENT_PREALLOCATE=false `
-    nvcr.io/nvidia/jax:25.04-py3
-```
 
 ### Installation in vscode
 
 1. Install the [Dev Containers](https://marketplace.visualstudio.com/items?itemName=ms-vscode-remote.remote-containers) extension `ms-vscode-remote.remote-containers`.
 2. Open this repository's root folder in vscode.
-3. Run the command (via `F1`) `Dev Containers: Reopen in Container`.
-
+3. Run the command `Dev Containers: Reopen in Container`.
 
 ---
 
