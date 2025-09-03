@@ -8,7 +8,7 @@ import threading
 
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Final, Iterator, Literal, Self, TypedDict, cast
+from typing import Any, Final, Iterator, Literal, TypedDict, cast
 
 import flax.linen as nn
 import jax
@@ -115,7 +115,7 @@ def make_huggingface_iterator(
     if shuffle:
         if data_key is None:
             raise ValueError(
-                "A JAX PRNGKey `seed` must be provided when `shuffle=True`"
+                "A JAX PRNGKey `data_key` must be provided when `shuffle=True`"
             )
         huggingface_seed: int = int(jax.random.randint(data_key, (), 0, 2**31 - 1))
         dataset = dataset.shuffle(
@@ -124,23 +124,17 @@ def make_huggingface_iterator(
 
     def preprocess(batch: RawBatch) -> PreprocessedBatch:
         """Vectorized preprocessing for a batch of images and labels."""
-
-        raw_images: NDArray[np.uint8 | np.uint16 | np.uint32 | np.uint64] = np.stack(
-            [np.array(img) for img in batch["image"]]
-        )
-        assert raw_images.dtype in (np.uint8, np.uint16, np.uint32, np.uint64)
-
-        # Normalize image pixel intensities to [-1, 1]
+        # fmt: off
+        raw_images = np.stack([np.array(img) for img in batch["image"]])
         scale: ImageDType = ImageDType(2 / np.iinfo(raw_images.dtype).max)
-        images: NDArray[ImageDType] = raw_images.astype(
-            ImageDType
-        ) * scale - ImageDType(1)
-
+        images: NDArray[ImageDType] = raw_images.astype(ImageDType) * scale - ImageDType(1)
+        # fmt: on
         return {
-            "image": images.reshape(images.shape[0], -1),  # (Batch Size, Num. Pixels)
+            "image": images.reshape(images.shape[0], -1),
             "label": np.array(batch["label"], dtype=LabelDType),
         }
 
+    # Apply preprocessing and set the format to "jax"
     dataset = dataset.map(preprocess, batched=True, batch_size=batch_size).with_format(
         "numpy"
     )
@@ -269,10 +263,10 @@ class Metrics:
 
 def train_epoch(
     state: train_state.TrainState,
-    examples: Iterator[BatchedExamples],
+    batches: Iterator[BatchedExamples],
 ) -> tuple[train_state.TrainState, Metrics]:
     metrics = Metrics()
-    for xb, yb in examples:
+    for xb, yb in batches:
         state, loss, accuracy = train_step(state, xb, yb)
         metrics.update(float(loss), float(accuracy), xb.shape[0])
     return state, metrics
@@ -280,10 +274,10 @@ def train_epoch(
 
 def evaluate(
     state: train_state.TrainState,
-    examples: Iterator[BatchedExamples],
+    batches: Iterator[BatchedExamples],
 ) -> Metrics:
     metrics = Metrics()
-    for xb, yb in examples:
+    for xb, yb in batches:
         loss, accuracy = eval_step(state.params, state.apply_fn, xb, yb)
         metrics.update(float(loss), float(accuracy), xb.shape[0])
     return metrics
@@ -297,10 +291,10 @@ def main(configuration: Configuration) -> None:
 
     if configuration.clean_start and checkpoints_dir.exists():
         shutil.rmtree(checkpoints_dir)
-        logger.info("Existing checkpoints removed. Starting from scratch.")
+        logger.info("Starting from scratch - existing checkpoints removed")
 
     checkpoints_dir.mkdir(exist_ok=True, parents=True)
-    final_checkpoints_dir = checkpoints_dir / "final"
+    final_checkpoints_dir: Path = checkpoints_dir / "final"
     final_checkpoints_dir.mkdir(exist_ok=True)
 
     key = jax.random.PRNGKey(configuration.seed)
@@ -334,9 +328,6 @@ def main(configuration: Configuration) -> None:
         tx=optax.adam(scheduler),
     )
 
-    print("    initial_state:", type(initial_state))
-    print("initial_variables:", type(initial_variables))
-
     # Define a default checkpoint structure
     default_checkpoint = {
         "state": initial_state,
@@ -369,11 +360,7 @@ def main(configuration: Configuration) -> None:
     train_dataset: IterableDataset = load_iterable_mnist("train")
     test_dataset: IterableDataset = load_iterable_mnist("test")
 
-    training_completed: bool = False
-
     for epoch in range(start_epoch, configuration.epochs):
-        training_completed = training_completed or True
-
         key, data_key = jax.random.split(key)
 
         train_iter = make_huggingface_iterator(
@@ -433,7 +420,8 @@ def main(configuration: Configuration) -> None:
         }
         checkpoints_manager.save(epoch, args=ocp.args.StandardSave(checkpoint))
 
-    if training_completed:
+    else:
+        # This block runs only if the for loop completes without a `break`
         final_checkpoint = {
             "state": state,
             "best_loss": best_loss,
