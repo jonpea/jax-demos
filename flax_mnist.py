@@ -24,7 +24,6 @@ from custom_types import (
     ApplyFn,
     BatchedExamples,
     JaxArray,
-    JaxParams,
     JaxScalar,
     Metrics,
     PyTree,
@@ -102,15 +101,11 @@ class MLP(nn.Module):
 
 
 def compute_metrics(
-    apply_fn: ApplyFn, params: JaxParams, x: JaxArray, y: JaxArray
+    apply_fn: ApplyFn, params: PyTree, x: JaxArray, y: JaxArray
 ) -> Metrics:
     logits: JaxArray = apply_fn({"params": params}, x)
-    loss: JaxScalar = (
-        optax.softmax_cross_entropy_with_integer_labels(logits, y)
-        .mean()
-        .astype(jnp.float32)
-    )
-    accuracy: JaxScalar = (jnp.argmax(logits, axis=-1) == y).mean().astype(jnp.float32)
+    loss: JaxScalar = optax.softmax_cross_entropy_with_integer_labels(logits, y).mean()
+    accuracy: JaxScalar = (jnp.argmax(logits, axis=-1) == y).mean()
     return loss, accuracy
 
 
@@ -120,7 +115,7 @@ def train_step(
 ) -> tuple[train_state.TrainState, JaxScalar, JaxScalar]:
     """Evaluates training loss function and accuracy."""
 
-    def _compute_metrics(params: JaxParams) -> Metrics:
+    def _compute_metrics(params: PyTree) -> Metrics:
         """Partially applies the metrics function for various parameters."""
         return compute_metrics(state.apply_fn, params, x, y)
 
@@ -139,7 +134,7 @@ def jit_eval_step(apply_fn) -> Callable:
     """Generates the evaluation function."""
 
     @jax.jit
-    def evaluate(params: JaxParams, x: JaxArray, y: JaxArray) -> Metrics:
+    def evaluate(params: PyTree, x: JaxArray, y: JaxArray) -> Metrics:
         return compute_metrics(apply_fn, params, x, y)
 
     return evaluate
@@ -366,15 +361,39 @@ def parse_args() -> Configuration:
         type=int,
     )
     parser.add_argument(
+        "--early-stopping-patience",
+        default=_DEFAULTS.early_stopping_patience,
+        help="Early stopping patience",
+        type=int,
+    )
+    parser.add_argument(
+        "--eval-every-n-epochs",
+        default=_DEFAULTS.eval_every_n_epochs,
+        help="Evaluation frequency",
+        type=int,
+    )
+    parser.add_argument(
         "--learning-rate",
         default=_DEFAULTS.learning_rate,
         help="Learning rate",
         type=float,
     )
     parser.add_argument(
+        "--prefetch",
+        default=_DEFAULTS.prefetch,
+        help="Number of batches to prefetch",
+        type=int,
+    )
+    parser.add_argument(
         "--seed",
         default=_DEFAULTS.seed,
         help="Seed for pseudo-random number generator",
+        type=int,
+    )
+    parser.add_argument(
+        "--shuffle-buffer-size",
+        default=_DEFAULTS.shuffle_buffer_size,
+        help="Shuffle buffer size",
         type=int,
     )
 

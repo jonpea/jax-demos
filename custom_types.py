@@ -10,7 +10,6 @@ LabelDType: TypeAlias = np.int32
 
 type JaxArray = jax.Array
 type JaxScalar = jax.Array  # scalar array with shape ()
-type JaxParams = dict[str, dict]
 type PyTree = Any
 type Split = Literal["train", "test"]
 

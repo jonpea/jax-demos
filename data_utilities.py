@@ -23,7 +23,7 @@ T = TypeVar("T")
 _SENTINEL: Final = object()
 
 
-def prefetch(batches: Iterator[T], size: int = 2) -> Iterator[T]:
+def prefetch(batches: Iterator[T], size: int = 2, timeout: float = 5.0) -> Iterator[T]:
     """Prefetch a few batches to device on a background thread."""
 
     if size <= 0:
@@ -51,7 +51,7 @@ def prefetch(batches: Iterator[T], size: int = 2) -> Iterator[T]:
 
     try:
         while True:
-            item = q.get()
+            item = q.get(timeout=timeout)
             if isinstance(item, Exception):
                 raise item
             if item is _SENTINEL:
@@ -59,7 +59,7 @@ def prefetch(batches: Iterator[T], size: int = 2) -> Iterator[T]:
             yield cast(T, item)
     finally:
         thread_done.set()
-        thread.join(timeout=1.0)
+        thread.join(timeout=timeout)
 
 
 def make_huggingface_iterator(
