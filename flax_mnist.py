@@ -1,26 +1,26 @@
 import argparse
 import functools
-import pathlib
-from pathlib import Path
+import logging
 import queue
 import shutil
-import threading
-from dataclasses import dataclass
-import logging
 import sys
-from typing import Any, Final, Iterator, Literal, Mapping, cast
+import threading
 
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from typing import Any, Final, Iterator, Literal, Self, TypedDict, cast
+
+import flax.linen as nn
 import jax
 import jax.numpy as jnp
 import numpy as np
-from numpy.typing import NDArray
-
-import flax.linen as nn
-from flax.training import train_state
 import optax
 import orbax.checkpoint as ocp
 
 from datasets import load_dataset, IterableDataset, IterableDatasetDict
+from flax.training import train_state
+from numpy.typing import NDArray
+from PIL.Image import Image
 
 # Setup logging
 logging.getLogger("absl").setLevel(logging.WARNING)
@@ -34,17 +34,65 @@ if logger.hasHandlers():
 logger.addHandler(handler)
 logger.setLevel(logging.INFO)
 
-# ------------------ Types (PEP 695 aliases) ------------------
+# Type aliases (PEP 695)
 type JaxArray = jax.Array
 type Split = Literal["train", "test"]
+type BatchedExamples = tuple[JaxArray, JaxArray]  # (images, labels)
 
-# A batch = (images, labels)
-type BatchedExamples = tuple[JaxArray, JaxArray]
-type RawBatch = Mapping[str, NDArray[Any]]
-type PreprocessedBatch = Mapping[str, NDArray[Any]]
 
+class RawBatch(TypedDict):
+    """Raw labeled data (examples)."""
+
+    image: list[Image]
+    label: list[int]
+
+
+ImageDType: Final = np.float32
+LabelDType: Final = np.int32
+
+
+class PreprocessedBatch(TypedDict):
+    """Labeled data (examples) after batching/preprocessing."""
+
+    image: NDArray[ImageDType]
+    label: NDArray[LabelDType]
+
+
+@dataclass(frozen=True)
+class Configuration:
+    """Learning configuration parameters."""
+
+    batch_size: int = 128
+    checkpoints_dir: Path = Path("./checkpoints")
+    clean_start: bool = False
+    early_stopping_patience: int = 3
+    epochs: int = 5
+    eval_every_n_epochs: int = 1
+    learning_rate: float = 1e-3
+    prefetch: int = 2
+    seed: int = 0
+    shuffle_buffer_size: int = 50_000
+
+    def __post_init__(self):
+        assert self.batch_size > 0
+        assert self.epochs > 0
+        assert self.learning_rate > 0
+        assert self.prefetch >= 0
+        assert self.eval_every_n_epochs > 0
+        assert self.early_stopping_patience >= 0
+
+    def serialization_workaround(self) -> dict[str, Any]:
+        """orbax-serialization doesn't support pathlib.Path or even str(?)"""
+        d = asdict(self)
+        d.pop("checkpoints_dir")
+        return d
+
+
+_DEFAULTS: Final = Configuration()
 
 # ------------------ Data utils (HF streaming) ------------------
+
+
 def load_iterable_mnist(split: Split) -> IterableDataset:
     """Return an IterableDataset for the given split, with streaming enabled."""
     out = load_dataset("mnist", split=split, streaming=True)
@@ -55,51 +103,74 @@ def load_iterable_mnist(split: Split) -> IterableDataset:
 
 
 def make_huggingface_iterator(
-    ds: IterableDataset,
-    batch_size: int,
+    dataset: IterableDataset,
+    shuffle: bool,  # training: True;  evaluation: False
     *,
-    shuffle: bool = True,
-    seed: JaxArray | None = None,
-    shuffle_buffer_size: int = 50_000,
+    batch_size: int = _DEFAULTS.batch_size,
+    data_key: JaxArray | None = None,
+    shuffle_buffer_size: int = _DEFAULTS.shuffle_buffer_size,
 ) -> Iterator[BatchedExamples]:
     """Optimized pipeline with batched preprocessing."""
 
-    hf_seed: int = 0 if seed is None else int(jax.random.key_data(seed)[0])
+    if shuffle:
+        if data_key is None:
+            raise ValueError(
+                "A JAX PRNGKey `seed` must be provided when `shuffle=True`"
+            )
+        huggingface_seed: int = int(jax.random.randint(data_key, (), 0, 2**31 - 1))
+        dataset = dataset.shuffle(
+            seed=huggingface_seed, buffer_size=shuffle_buffer_size
+        )
 
     def preprocess(batch: RawBatch) -> PreprocessedBatch:
         """Vectorized preprocessing for a batch of images and labels."""
-        images = np.array(batch["image"], dtype=np.float32) / 127.5 - 1.0
-        images = images.reshape(images.shape[0], -1)  # (B, 784)
-        labels = np.array(batch["label"], dtype=np.int32)
-        return {"image": images, "label": labels}
 
-    if shuffle:
-        ds = ds.shuffle(seed=hf_seed, buffer_size=shuffle_buffer_size)
+        raw_images: NDArray[np.uint8 | np.uint16 | np.uint32 | np.uint64] = np.stack(
+            [np.array(img) for img in batch["image"]]
+        )
+        assert raw_images.dtype in (np.uint8, np.uint16, np.uint32, np.uint64)
 
-    ds = ds.map(preprocess, batched=True, batch_size=batch_size).with_format("numpy")
+        # Normalize image pixel intensities to [-1, 1]
+        scale: ImageDType = ImageDType(2 / np.iinfo(raw_images.dtype).max)
+        images: NDArray[ImageDType] = raw_images.astype(
+            ImageDType
+        ) * scale - ImageDType(1)
 
-    for batch in ds.iter(batch_size=batch_size):
+        return {
+            "image": images.reshape(images.shape[0], -1),  # (Batch Size, Num. Pixels)
+            "label": np.array(batch["label"], dtype=LabelDType),
+        }
+
+    dataset = dataset.map(preprocess, batched=True, batch_size=batch_size).with_format(
+        "numpy"
+    )
+
+    for batch in dataset.iter(batch_size=batch_size):
         xb = jnp.asarray(batch["image"], dtype=jnp.float32)
         yb = jnp.asarray(batch["label"], dtype=jnp.int32)
         yield (xb, yb)
 
 
 # ------------------ Small prefetcher (host→device) ------------------
-class _Sentinel:
-    pass
+_SENTINEL: Final = object()
 
 
-_SENTINEL: Final = _Sentinel()
-
-
-def prefetch(it: Iterator[BatchedExamples], size: int = 2) -> Iterator[BatchedExamples]:
+def prefetch(
+    batches: Iterator[BatchedExamples], size: int = 2
+) -> Iterator[BatchedExamples]:
     """Prefetch a few batches to device on a background thread."""
-    q: queue.Queue[BatchedExamples | _Sentinel | Exception] = queue.Queue(maxsize=size)
+
+    if size <= 0:
+        # No pre-fetch
+        yield from batches
+        return
+
+    q: queue.Queue[BatchedExamples | object | Exception] = queue.Queue(maxsize=size)
     thread_done = threading.Event()
 
-    def _worker() -> None:
+    def prefetch_worker() -> None:
         try:
-            for b in it:
+            for b in batches:
                 if thread_done.is_set():
                     break
                 q.put(jax.device_put(b))
@@ -109,7 +180,7 @@ def prefetch(it: Iterator[BatchedExamples], size: int = 2) -> Iterator[BatchedEx
         finally:
             thread_done.set()
 
-    thread = threading.Thread(target=_worker, daemon=True)
+    thread = threading.Thread(target=prefetch_worker, daemon=True)
     thread.start()
 
     try:
@@ -127,11 +198,13 @@ def prefetch(it: Iterator[BatchedExamples], size: int = 2) -> Iterator[BatchedEx
 
 # ------------------ Model ------------------
 class MLP(nn.Module):
+    """Multi-layer perceptron approximation architecture."""
+
     hidden_dim: int = 256
     num_classes: int = 10
 
     @nn.compact
-    def __call__(self, x: jax.Array) -> jax.Array:
+    def __call__(self, x: JaxArray) -> JaxArray:
         x = nn.relu(nn.Dense(self.hidden_dim)(x))
         x = nn.Dense(self.num_classes)(x)
         return x
@@ -139,11 +212,11 @@ class MLP(nn.Module):
 
 # ------------------ Train / Eval steps ------------------
 def compute_metrics(
-    apply_fn, params, x: jax.Array, y: jax.Array
-) -> tuple[jax.Array, jax.Array]:
-    logits = apply_fn({"params": params}, x)
-    loss = optax.softmax_cross_entropy_with_integer_labels(logits, y).mean()
-    accuracy = (jnp.argmax(logits, axis=-1) == y).mean()
+    apply_fn, params, x: JaxArray, y: JaxArray
+) -> tuple[JaxArray, JaxArray]:
+    logits: JaxArray = apply_fn({"params": params}, x)
+    loss: JaxArray = optax.softmax_cross_entropy_with_integer_labels(logits, y).mean()
+    accuracy: JaxArray = (jnp.argmax(logits, axis=-1) == y).mean()
     return loss, accuracy
 
 
@@ -152,9 +225,11 @@ def train_step(
     state: train_state.TrainState, x: JaxArray, y: JaxArray
 ) -> tuple[train_state.TrainState, JaxArray, JaxArray]:
     def _loss_fn(params):
-        logits = state.apply_fn({"params": params}, x)
-        loss = optax.softmax_cross_entropy_with_integer_labels(logits, y).mean()
-        accuracy = (jnp.argmax(logits, axis=-1) == y).mean()
+        logits: JaxArray = state.apply_fn({"params": params}, x)
+        loss: JaxArray = optax.softmax_cross_entropy_with_integer_labels(
+            logits, y
+        ).mean()
+        accuracy: JaxArray = (jnp.argmax(logits, axis=-1) == y).mean()
         return loss, accuracy
 
     (loss, accuracy), grads = jax.value_and_grad(_loss_fn, has_aux=True)(state.params)
@@ -169,50 +244,35 @@ def eval_step(params, apply_fn, x: JaxArray, y: JaxArray) -> tuple[JaxArray, Jax
 
 # ------------------ Runner ------------------
 @dataclass
-class Metrics:
-    loss: float = 0.0
-    accuracy: float = 0.0
+class Averaged:
+    aggregate: float = 0.0
     count: int = 0
 
-    def update(self, loss: float, accuracy: float, batch_size: int) -> None:
-        self.loss += loss * batch_size
-        self.accuracy += accuracy * batch_size
+    def update(self, x: float, batch_size: int) -> None:
+        self.aggregate += x * batch_size
         self.count += batch_size
 
-    def compute(self) -> tuple[float, float]:
-        if self.count == 0:
-            return 0.0, 0.0
-        return self.loss / self.count, self.accuracy / self.count
+    @property
+    def mean(self) -> float:
+        return np.nan if self.count == 0 else self.aggregate / self.count
 
 
-@dataclass(frozen=True)
-class Configuration:
-    batch_size: int = 128
-    checkpoints_dir: Path = Path("./checkpoints")
-    epochs: int = 5
-    learning_rate: float = 1e-3
-    prefetch: int = 2
-    seed: int = 0
-    shuffle_buffer_size: int = 50_000
-    eval_every_n_epochs: int = 1
-    early_stopping_patience: int = 3
-    clean_start: bool = False
+@dataclass
+class Metrics:
+    loss: Averaged = field(default_factory=Averaged)
+    accuracy: Averaged = field(default_factory=Averaged)
 
-    def __post_init__(self):
-        assert self.batch_size > 0
-        assert self.epochs > 0
-        assert self.learning_rate > 0
-        assert self.prefetch >= 0
-        assert self.eval_every_n_epochs > 0
-        assert self.early_stopping_patience >= 0
+    def update(self, loss, accuracy, batch_size: int) -> None:
+        self.loss.update(float(loss), batch_size)
+        self.accuracy.update(float(accuracy), batch_size)
 
 
 def train_epoch(
     state: train_state.TrainState,
-    iterator: Iterator[BatchedExamples],
+    examples: Iterator[BatchedExamples],
 ) -> tuple[train_state.TrainState, Metrics]:
     metrics = Metrics()
-    for xb, yb in iterator:
+    for xb, yb in examples:
         state, loss, accuracy = train_step(state, xb, yb)
         metrics.update(float(loss), float(accuracy), xb.shape[0])
     return state, metrics
@@ -220,24 +280,28 @@ def train_epoch(
 
 def evaluate(
     state: train_state.TrainState,
-    iterator: Iterator[BatchedExamples],
+    examples: Iterator[BatchedExamples],
 ) -> Metrics:
     metrics = Metrics()
-    for xb, yb in iterator:
+    for xb, yb in examples:
         loss, accuracy = eval_step(state.params, state.apply_fn, xb, yb)
         metrics.update(float(loss), float(accuracy), xb.shape[0])
     return metrics
 
 
 def main(configuration: Configuration) -> None:
+    """Main script driver."""
+
     # Prepare checkpointing
-    checkpoints_dir = configuration.checkpoints_dir.resolve()
+    checkpoints_dir: Path = configuration.checkpoints_dir.resolve()
 
     if configuration.clean_start and checkpoints_dir.exists():
         shutil.rmtree(checkpoints_dir)
         logger.info("Existing checkpoints removed. Starting from scratch.")
 
     checkpoints_dir.mkdir(exist_ok=True, parents=True)
+    final_checkpoints_dir = checkpoints_dir / "final"
+    final_checkpoints_dir.mkdir(exist_ok=True)
 
     key = jax.random.PRNGKey(configuration.seed)
 
@@ -246,6 +310,11 @@ def main(configuration: Configuration) -> None:
     checkpoints_options = ocp.CheckpointManagerOptions(max_to_keep=5, create=True)
     checkpoints_manager = ocp.CheckpointManager(
         checkpoints_dir, options=checkpoints_options
+    )
+
+    final_checkpoint_manager = ocp.CheckpointManager(
+        final_checkpoints_dir,
+        options=ocp.CheckpointManagerOptions(max_to_keep=1, create=True),
     )
 
     train_ds_size = 60_000
@@ -265,6 +334,9 @@ def main(configuration: Configuration) -> None:
         tx=optax.adam(scheduler),
     )
 
+    print("    initial_state:", type(initial_state))
+    print("initial_variables:", type(initial_variables))
+
     # Define a default checkpoint structure
     default_checkpoint = {
         "state": initial_state,
@@ -277,51 +349,57 @@ def main(configuration: Configuration) -> None:
     latest_step = checkpoints_manager.latest_step()
     if latest_step is not None:
         logger.info(f"Restoring from checkpoint at step {latest_step}")
-        restored_ckpt = checkpoints_manager.restore(
+        restored_checkpoint = checkpoints_manager.restore(
             step=latest_step,
             args=ocp.args.StandardRestore(default_checkpoint),
         )
     else:
         logger.info("No checkpoints found. Starting from scratch.")
-        restored_ckpt = default_checkpoint
+        restored_checkpoint = default_checkpoint
 
     # Check if the restored object is a dictionary, which it should be with StandardRestore
-    if not isinstance(restored_ckpt, dict):
+    if not isinstance(restored_checkpoint, dict):
         raise TypeError("Expected restored checkpoint to be a dictionary.")
 
-    state = restored_ckpt["state"]
-    best_loss = restored_ckpt.get("best_loss", float("inf"))
-    patience_counter = restored_ckpt.get("patience", 0)
-    start_epoch = restored_ckpt.get("epoch", 0) + 1
+    state = restored_checkpoint["state"]
+    best_loss = restored_checkpoint.get("best_loss", float("inf"))
+    patience_counter = restored_checkpoint.get("patience", 0)
+    start_epoch = restored_checkpoint.get("epoch", 0) + 1
 
-    train_ds = load_iterable_mnist("train")
-    test_ds = load_iterable_mnist("test")
+    train_dataset: IterableDataset = load_iterable_mnist("train")
+    test_dataset: IterableDataset = load_iterable_mnist("test")
+
+    training_completed: bool = False
 
     for epoch in range(start_epoch, configuration.epochs):
+        training_completed = training_completed or True
+
         key, data_key = jax.random.split(key)
 
         train_iter = make_huggingface_iterator(
-            train_ds,
-            configuration.batch_size,
+            dataset=train_dataset,
             shuffle=True,
-            seed=data_key,
+            data_key=data_key,
+            batch_size=configuration.batch_size,
             shuffle_buffer_size=configuration.shuffle_buffer_size,
         )
         train_iter_prefetched = prefetch(train_iter, size=configuration.prefetch)
 
         state, train_metrics = train_epoch(state, train_iter_prefetched)
-        train_loss, train_accuracy = train_metrics.compute()
+        train_loss = train_metrics.loss.mean
+        train_accuracy = train_metrics.accuracy.mean
 
         if epoch % configuration.eval_every_n_epochs == 0:
             eval_iter = make_huggingface_iterator(
-                test_ds,
-                configuration.batch_size,
+                dataset=test_dataset,
                 shuffle=False,
+                batch_size=configuration.batch_size,
             )
             eval_iter_prefetched = prefetch(eval_iter, size=configuration.prefetch)
 
             eval_metrics = evaluate(state, eval_iter_prefetched)
-            eval_loss, eval_accuracy = eval_metrics.compute()
+            eval_loss = eval_metrics.loss.mean
+            eval_accuracy = eval_metrics.accuracy.mean
 
             logger.info(
                 f"[Flax] epoch {epoch} "
@@ -355,27 +433,76 @@ def main(configuration: Configuration) -> None:
         }
         checkpoints_manager.save(epoch, args=ocp.args.StandardSave(checkpoint))
 
+    if training_completed:
+        final_checkpoint = {
+            "state": state,
+            "best_loss": best_loss,
+            "final_epoch": epoch,
+            "config": configuration.serialization_workaround(),
+        }
+        final_checkpoint_manager.save(
+            epoch, args=ocp.args.StandardSave(final_checkpoint)
+        )
+
     logger.info(f"Training completed. Best test loss: {best_loss:.4f}")
 
 
 def parse_args() -> Configuration:
-    defaults = Configuration()
-    parser = argparse.ArgumentParser(description="Train MLP on MNIST with Flax")
-    parser.add_argument("--batch-size", type=int, default=defaults.batch_size)
-    parser.add_argument(
-        "--checkpoints-dir", type=pathlib.Path, default=defaults.checkpoints_dir
+    """Processes command-line arguments."""
+
+    parser = argparse.ArgumentParser(
+        description="Train digit classifier on MNIST database"
     )
     parser.add_argument(
-        "--clean_start", action="store_true", default=defaults.clean_start
+        "--batch-size",
+        default=_DEFAULTS.batch_size,
+        help="Batch size for training",
+        type=int,
     )
-    parser.add_argument("--epochs", type=int, default=defaults.epochs)
-    parser.add_argument("--learning-rate", type=float, default=defaults.learning_rate)
-    parser.add_argument("--seed", type=int, default=defaults.seed)
+    parser.add_argument(
+        "--checkpoints-dir",
+        default=_DEFAULTS.checkpoints_dir,
+        help="Directory to save checkpoints",
+        type=Path,
+    )
+    parser.add_argument(
+        "--clean-start",
+        action="store_true",
+        default=_DEFAULTS.clean_start,
+        help="Remove existing checkpoints and start fresh",
+    )
+    parser.add_argument(
+        "--epochs",
+        default=_DEFAULTS.epochs,
+        help="Number of training epochs",
+        type=int,
+    )
+    parser.add_argument(
+        "--learning-rate",
+        default=_DEFAULTS.learning_rate,
+        help="Learning rate",
+        type=float,
+    )
+    parser.add_argument(
+        "--seed",
+        default=_DEFAULTS.seed,
+        help="Seed for pseudo-random number generator",
+        type=int,
+    )
 
     args = parser.parse_args()
     return Configuration(**vars(args))
 
 
+def cleanup():
+    """Release JAX resources."""
+    jax.clear_caches()
+    # jax.clear_backends() was removed in JAX v0.4.36
+
+
 if __name__ == "__main__":
     config = parse_args()
-    main(config)
+    try:
+        main(config)
+    finally:
+        cleanup()
