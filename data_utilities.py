@@ -128,7 +128,7 @@ class RunningAverage:
 
 
 @dataclass
-class Metrics:
+class RunningMetrics:
     loss: RunningAverage = field(default_factory=RunningAverage)
     accuracy: RunningAverage = field(default_factory=RunningAverage)
 

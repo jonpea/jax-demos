@@ -6,7 +6,7 @@ import sys
 
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Final, Iterator, Literal
+from typing import Any, Callable, Final, Iterator
 
 import flax.linen as nn
 import jax
@@ -20,7 +20,17 @@ from datasets import load_dataset, IterableDataset, IterableDatasetDict
 # from flax.training import common_utils
 from flax.training import train_state
 
-from data_utilities import Metrics, prefetch, make_huggingface_iterator
+from custom_types import (
+    ApplyFn,
+    BatchedExamples,
+    JaxArray,
+    JaxParams,
+    JaxScalar,
+    Metrics,
+    PyTree,
+    Split,
+)
+from data_utilities import RunningMetrics, prefetch, make_huggingface_iterator
 
 
 # Setup logging
@@ -34,11 +44,6 @@ logger = logging.getLogger(__name__)
 logging.getLogger("absl").setLevel(logging.WARNING)
 logging.getLogger("jax").setLevel(logging.WARNING)
 logging.getLogger("orbax").setLevel(logging.WARNING)
-
-# Type aliases (PEP 695)
-type JaxArray = jax.Array
-type Split = Literal["train", "test"]
-type BatchedExamples = tuple[JaxArray, JaxArray]  # (images, labels)
 
 
 @dataclass(frozen=True)
@@ -97,54 +102,54 @@ class MLP(nn.Module):
 
 
 def compute_metrics(
-    apply_fn, params, x: JaxArray, y: JaxArray
-) -> tuple[JaxArray, JaxArray]:
+    apply_fn: ApplyFn, params: JaxParams, x: JaxArray, y: JaxArray
+) -> Metrics:
     logits: JaxArray = apply_fn({"params": params}, x)
-    loss: JaxArray = (
+    loss: JaxScalar = (
         optax.softmax_cross_entropy_with_integer_labels(logits, y)
         .mean()
         .astype(jnp.float32)
     )
-    accuracy: JaxArray = (jnp.argmax(logits, axis=-1) == y).mean().astype(jnp.float32)
+    accuracy: JaxScalar = (jnp.argmax(logits, axis=-1) == y).mean().astype(jnp.float32)
     return loss, accuracy
 
 
 @functools.partial(jax.jit, donate_argnums=(0,))
 def train_step(
     state: train_state.TrainState, x: JaxArray, y: JaxArray
-) -> tuple[train_state.TrainState, JaxArray, JaxArray]:
+) -> tuple[train_state.TrainState, JaxScalar, JaxScalar]:
     """Evaluates training loss function and accuracy."""
 
-    def _loss_fn(params):
-        logits: JaxArray = state.apply_fn({"params": params}, x)
-        loss: JaxArray = (
-            optax.softmax_cross_entropy_with_integer_labels(logits, y)
-            .mean()
-            .astype(jnp.float32)
-        )
-        accuracy: JaxArray = (
-            (jnp.argmax(logits, axis=-1) == y).mean().astype(jnp.float32)
-        )
-        return loss, accuracy
+    def _compute_metrics(params: JaxParams) -> Metrics:
+        """Partially applies the metrics function for various parameters."""
+        return compute_metrics(state.apply_fn, params, x, y)
 
-    (loss, accuracy), grads = jax.value_and_grad(_loss_fn, has_aux=True)(state.params)
-    state = state.apply_gradients(grads=grads)
-    return state, loss, accuracy
+    loss: JaxScalar
+    accuracy: JaxScalar
+    grads: PyTree
+    (loss, accuracy), grads = jax.value_and_grad(
+        _compute_metrics,
+        has_aux=True,
+    )(state.params)
+    next_state: train_state.TrainState = state.apply_gradients(grads=grads)
+    return next_state, loss, accuracy
 
 
-def make_eval_step(apply_fn):
+def jit_eval_step(apply_fn) -> Callable:
+    """Generates the evaluation function."""
+
     @jax.jit
-    def _eval(params, x: JaxArray, y: JaxArray):
+    def evaluate(params: JaxParams, x: JaxArray, y: JaxArray) -> Metrics:
         return compute_metrics(apply_fn, params, x, y)
 
-    return _eval
+    return evaluate
 
 
 def train_epoch(
     state: train_state.TrainState,
     batches: Iterator[BatchedExamples],
-) -> tuple[train_state.TrainState, Metrics]:
-    metrics = Metrics()
+) -> tuple[train_state.TrainState, RunningMetrics]:
+    metrics = RunningMetrics()
     for xb, yb in batches:
         state, loss, accuracy = train_step(state, xb, yb)
         metrics.update(float(loss), float(accuracy), xb.shape[0])
@@ -154,10 +159,10 @@ def train_epoch(
 def evaluate(
     state: train_state.TrainState,
     batches: Iterator[BatchedExamples],
-) -> Metrics:
-    metrics = Metrics()
+) -> RunningMetrics:
+    metrics = RunningMetrics()
+    eval_step: Callable = jit_eval_step(state.apply_fn)
     for xb, yb in batches:
-        eval_step = make_eval_step(state.apply_fn)
         loss, accuracy = eval_step(state.params, xb, yb)
         metrics.update(float(loss), float(accuracy), xb.shape[0])
     return metrics

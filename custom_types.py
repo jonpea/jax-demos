@@ -1,4 +1,4 @@
-from typing import TypeAlias, TypedDict
+from typing import Any, Literal, Protocol, TypeAlias, TypedDict
 
 import jax
 import numpy as np
@@ -8,8 +8,18 @@ from PIL.Image import Image
 ImageDType: TypeAlias = np.float32
 LabelDType: TypeAlias = np.int32
 
-type BatchedExamples = tuple[JaxArray, JaxArray]  # (images, labels)
 type JaxArray = jax.Array
+type JaxScalar = jax.Array  # scalar array with shape ()
+type JaxParams = dict[str, dict]
+type PyTree = Any
+type Split = Literal["train", "test"]
+
+type BatchedExamples = tuple[JaxArray, JaxArray]  # (images, labels)
+type Metrics = tuple[JaxScalar, JaxScalar]  # (loss, accuracy)
+
+
+class ApplyFn(Protocol):
+    def __call__(self, vars: PyTree, x: JaxArray) -> JaxArray: ...
 
 
 class RawBatch(TypedDict):
