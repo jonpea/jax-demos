@@ -1,26 +1,26 @@
 import argparse
 import functools
 import logging
-import queue
 import shutil
 import sys
-import threading
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Final, Iterator, Literal, TypedDict, cast
+from typing import Any, Final, Iterator, Literal
 
 import flax.linen as nn
 import jax
 import jax.numpy as jnp
-import numpy as np
 import optax
 import orbax.checkpoint as ocp
 
 from datasets import load_dataset, IterableDataset, IterableDatasetDict
+# from flax import jax_utils
+# from flax.training import common_utils
 from flax.training import train_state
-from numpy.typing import NDArray
-from PIL.Image import Image
+
+from data_utilities import Metrics, prefetch, make_huggingface_iterator
+
 
 # Setup logging
 logging.basicConfig(
@@ -38,24 +38,6 @@ logging.getLogger("orbax").setLevel(logging.WARNING)
 type JaxArray = jax.Array
 type Split = Literal["train", "test"]
 type BatchedExamples = tuple[JaxArray, JaxArray]  # (images, labels)
-
-
-class RawBatch(TypedDict):
-    """Raw labeled data (examples)."""
-
-    image: list[Image]
-    label: list[int]
-
-
-ImageDType: Final = np.float32
-LabelDType: Final = np.int32
-
-
-class PreprocessedBatch(TypedDict):
-    """Labeled data (examples) after batching/preprocessing."""
-
-    image: NDArray[ImageDType]
-    label: NDArray[LabelDType]
 
 
 @dataclass(frozen=True)
@@ -102,94 +84,6 @@ def load_iterable_mnist(split: Split) -> IterableDataset:
     return out
 
 
-def make_huggingface_iterator(
-    dataset: IterableDataset,
-    shuffle: bool,  # training: True;  evaluation: False
-    *,
-    batch_size: int = _DEFAULTS.batch_size,
-    data_key: JaxArray | None = None,
-    shuffle_buffer_size: int = _DEFAULTS.shuffle_buffer_size,
-) -> Iterator[BatchedExamples]:
-    """Optimized pipeline with batched preprocessing."""
-
-    if shuffle:
-        if data_key is None:
-            raise ValueError(
-                "A JAX PRNGKey `data_key` must be provided when `shuffle=True`"
-            )
-        huggingface_seed: int = int(jax.random.randint(data_key, (), 0, 2**31 - 1))
-        dataset = dataset.shuffle(
-            seed=huggingface_seed, buffer_size=shuffle_buffer_size
-        )
-
-    def preprocess(batch: RawBatch) -> PreprocessedBatch:
-        """Vectorized preprocessing for a batch of images and labels."""
-        # fmt: off
-        raw_images = np.stack([np.array(img) for img in batch["image"]])
-        scale: ImageDType = ImageDType(2 / np.iinfo(raw_images.dtype).max)
-        images: NDArray[ImageDType] = raw_images.astype(ImageDType) * scale - ImageDType(1)
-        # fmt: on
-        return {
-            "image": images.reshape(images.shape[0], -1),
-            "label": np.array(batch["label"], dtype=LabelDType),
-        }
-
-    # Apply preprocessing and set the format to "jax"
-    dataset = dataset.map(preprocess, batched=True, batch_size=batch_size).with_format(
-        "numpy"
-    )
-
-    for batch in dataset.iter(batch_size=batch_size):
-        xb = jnp.asarray(batch["image"], dtype=jnp.float32)
-        yb = jnp.asarray(batch["label"], dtype=jnp.int32)
-        yield (xb, yb)
-
-
-# ------------------ Small prefetcher (host→device) ------------------
-_SENTINEL: Final = object()
-
-
-def prefetch(
-    batches: Iterator[BatchedExamples], size: int = 2
-) -> Iterator[BatchedExamples]:
-    """Prefetch a few batches to device on a background thread."""
-
-    if size <= 0:
-        # No pre-fetch
-        yield from batches
-        return
-
-    q: queue.Queue[BatchedExamples | object | Exception] = queue.Queue(maxsize=size)
-    thread_done = threading.Event()
-
-    def prefetch_worker() -> None:
-        try:
-            for b in batches:
-                if thread_done.is_set():
-                    break
-                q.put(jax.device_put(b))
-            q.put(_SENTINEL)
-        except Exception as e:
-            q.put(e)
-        finally:
-            thread_done.set()
-
-    thread = threading.Thread(target=prefetch_worker, daemon=True)
-    thread.start()
-
-    try:
-        while True:
-            item = q.get()
-            if isinstance(item, Exception):
-                raise item
-            if item is _SENTINEL:
-                break
-            yield cast(BatchedExamples, item)
-    finally:
-        thread_done.set()
-        thread.join(timeout=1.0)
-
-
 # ------------------ Model ------------------
 class MLP(nn.Module):
     """Multi-layer perceptron approximation architecture."""
@@ -209,8 +103,12 @@ def compute_metrics(
     apply_fn, params, x: JaxArray, y: JaxArray
 ) -> tuple[JaxArray, JaxArray]:
     logits: JaxArray = apply_fn({"params": params}, x)
-    loss: JaxArray = optax.softmax_cross_entropy_with_integer_labels(logits, y).mean()
-    accuracy: JaxArray = (jnp.argmax(logits, axis=-1) == y).mean()
+    loss: JaxArray = (
+        optax.softmax_cross_entropy_with_integer_labels(logits, y)
+        .mean()
+        .astype(jnp.float32)
+    )
+    accuracy: JaxArray = (jnp.argmax(logits, axis=-1) == y).mean().astype(jnp.float32)
     return loss, accuracy
 
 
@@ -218,12 +116,18 @@ def compute_metrics(
 def train_step(
     state: train_state.TrainState, x: JaxArray, y: JaxArray
 ) -> tuple[train_state.TrainState, JaxArray, JaxArray]:
+    """Evaluates training loss function and accuracy."""
+
     def _loss_fn(params):
         logits: JaxArray = state.apply_fn({"params": params}, x)
-        loss: JaxArray = optax.softmax_cross_entropy_with_integer_labels(
-            logits, y
-        ).mean()
-        accuracy: JaxArray = (jnp.argmax(logits, axis=-1) == y).mean()
+        loss: JaxArray = (
+            optax.softmax_cross_entropy_with_integer_labels(logits, y)
+            .mean()
+            .astype(jnp.float32)
+        )
+        accuracy: JaxArray = (
+            (jnp.argmax(logits, axis=-1) == y).mean().astype(jnp.float32)
+        )
         return loss, accuracy
 
     (loss, accuracy), grads = jax.value_and_grad(_loss_fn, has_aux=True)(state.params)
@@ -231,36 +135,15 @@ def train_step(
     return state, loss, accuracy
 
 
-@functools.partial(jax.jit, static_argnums=(1,))
-def eval_step(params, apply_fn, x: JaxArray, y: JaxArray) -> tuple[JaxArray, JaxArray]:
-    return compute_metrics(apply_fn, params, x, y)
+def make_eval_step(apply_fn):
+    @jax.jit
+    def _eval(params, x: JaxArray, y: JaxArray):
+        return compute_metrics(apply_fn, params, x, y)
+
+    return _eval
 
 
 # ------------------ Runner ------------------
-@dataclass
-class Averaged:
-    aggregate: float = 0.0
-    count: int = 0
-
-    def update(self, x: float, batch_size: int) -> None:
-        self.aggregate += x * batch_size
-        self.count += batch_size
-
-    @property
-    def mean(self) -> float:
-        return np.nan if self.count == 0 else self.aggregate / self.count
-
-
-@dataclass
-class Metrics:
-    loss: Averaged = field(default_factory=Averaged)
-    accuracy: Averaged = field(default_factory=Averaged)
-
-    def update(self, loss, accuracy, batch_size: int) -> None:
-        self.loss.update(float(loss), batch_size)
-        self.accuracy.update(float(accuracy), batch_size)
-
-
 def train_epoch(
     state: train_state.TrainState,
     batches: Iterator[BatchedExamples],
@@ -278,7 +161,8 @@ def evaluate(
 ) -> Metrics:
     metrics = Metrics()
     for xb, yb in batches:
-        loss, accuracy = eval_step(state.params, state.apply_fn, xb, yb)
+        eval_step = make_eval_step(state.apply_fn)
+        loss, accuracy = eval_step(state.params, xb, yb)
         metrics.update(float(loss), float(accuracy), xb.shape[0])
     return metrics
 
@@ -300,6 +184,15 @@ def main(configuration: Configuration) -> None:
     key = jax.random.PRNGKey(configuration.seed)
 
     logger.info(f"Using {jax.device_count()} device(s): {jax.devices()}")
+    logger.info(
+        "Config | seed=%d batch=%d epochs=%d lr=%.2e prefetch=%d buffer=%d",
+        configuration.seed,
+        configuration.batch_size,
+        configuration.epochs,
+        configuration.learning_rate,
+        configuration.prefetch,
+        configuration.shuffle_buffer_size,
+    )
 
     checkpoints_options = ocp.CheckpointManagerOptions(max_to_keep=5, create=True)
     checkpoints_manager = ocp.CheckpointManager(
@@ -371,6 +264,9 @@ def main(configuration: Configuration) -> None:
             shuffle_buffer_size=configuration.shuffle_buffer_size,
         )
         train_iter_prefetched = prefetch(train_iter, size=configuration.prefetch)
+        # train_iter_prefetched = jax_utils.prefetch_to_device(
+        #     train_iter, size=configuration.prefetch
+        # )
 
         state, train_metrics = train_epoch(state, train_iter_prefetched)
         train_loss = train_metrics.loss.mean
@@ -383,6 +279,9 @@ def main(configuration: Configuration) -> None:
                 batch_size=configuration.batch_size,
             )
             eval_iter_prefetched = prefetch(eval_iter, size=configuration.prefetch)
+            # eval_iter_prefetched = jax_utils.prefetch_to_device(
+            #     eval_iter, size=configuration.prefetch
+            # )
 
             eval_metrics = evaluate(state, eval_iter_prefetched)
             eval_loss = eval_metrics.loss.mean
