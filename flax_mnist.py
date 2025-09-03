@@ -23,16 +23,16 @@ from numpy.typing import NDArray
 from PIL.Image import Image
 
 # Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
+)
+logger = logging.getLogger(__name__)
+# Silence noisy loggers
 logging.getLogger("absl").setLevel(logging.WARNING)
 logging.getLogger("jax").setLevel(logging.WARNING)
 logging.getLogger("orbax").setLevel(logging.WARNING)
-handler = logging.StreamHandler(sys.stdout)
-handler.setFormatter(logging.Formatter("%(message)s"))
-logger = logging.getLogger(__name__)
-if logger.hasHandlers():
-    logger.handlers.clear()
-logger.addHandler(handler)
-logger.setLevel(logging.INFO)
 
 # Type aliases (PEP 695)
 type JaxArray = jax.Array
