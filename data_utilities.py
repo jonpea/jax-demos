@@ -9,7 +9,14 @@ import numpy as np
 from datasets import IterableDataset
 from numpy.typing import NDArray
 
-from custom_types import BatchedExamples, RawBatch, JaxArray, PreprocessedBatch, ImageDType, LabelDType
+from custom_types import (
+    BatchedExamples,
+    RawBatch,
+    JaxArray,
+    PreprocessedBatch,
+    ImageDType,
+    LabelDType,
+)
 
 
 T = TypeVar("T")
@@ -92,9 +99,11 @@ def make_huggingface_iterator(
         }
 
     # Apply preprocessing and set the format to "jax"
-    dataset = dataset.map(preprocess, batched=True, batch_size=batch_size).with_format(
-        "numpy"
-    )
+    dataset = dataset.map(
+        preprocess,
+        batched=True,
+        batch_size=batch_size,
+    ).with_format("numpy")
 
     for batch in dataset.iter(batch_size=batch_size):
         xb = jnp.asarray(batch["image"], dtype=jnp.float32)
@@ -103,7 +112,9 @@ def make_huggingface_iterator(
 
 
 @dataclass
-class Averaged:
+class RunningAverage:
+    """Maintains a running average."""
+
     aggregate: float = 0.0
     count: int = 0
 
@@ -118,8 +129,8 @@ class Averaged:
 
 @dataclass
 class Metrics:
-    loss: Averaged = field(default_factory=Averaged)
-    accuracy: Averaged = field(default_factory=Averaged)
+    loss: RunningAverage = field(default_factory=RunningAverage)
+    accuracy: RunningAverage = field(default_factory=RunningAverage)
 
     def update(self, loss, accuracy, batch_size: int) -> None:
         self.loss.update(float(loss), batch_size)

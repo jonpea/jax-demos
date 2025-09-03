@@ -15,6 +15,7 @@ import optax
 import orbax.checkpoint as ocp
 
 from datasets import load_dataset, IterableDataset, IterableDatasetDict
+
 # from flax import jax_utils
 # from flax.training import common_utils
 from flax.training import train_state
@@ -72,8 +73,6 @@ class Configuration:
 
 _DEFAULTS: Final = Configuration()
 
-# ------------------ Data utils (HF streaming) ------------------
-
 
 def load_iterable_mnist(split: Split) -> IterableDataset:
     """Return an IterableDataset for the given split, with streaming enabled."""
@@ -84,7 +83,6 @@ def load_iterable_mnist(split: Split) -> IterableDataset:
     return out
 
 
-# ------------------ Model ------------------
 class MLP(nn.Module):
     """Multi-layer perceptron approximation architecture."""
 
@@ -98,7 +96,6 @@ class MLP(nn.Module):
         return x
 
 
-# ------------------ Train / Eval steps ------------------
 def compute_metrics(
     apply_fn, params, x: JaxArray, y: JaxArray
 ) -> tuple[JaxArray, JaxArray]:
@@ -143,7 +140,6 @@ def make_eval_step(apply_fn):
     return _eval
 
 
-# ------------------ Runner ------------------
 def train_epoch(
     state: train_state.TrainState,
     batches: Iterator[BatchedExamples],
@@ -382,7 +378,7 @@ def parse_args() -> Configuration:
 
 
 def cleanup():
-    """Release JAX resources."""
+    """Releases resources."""
     jax.clear_caches()
     # jax.clear_backends() was removed in JAX v0.4.36
 
