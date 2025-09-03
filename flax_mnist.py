@@ -106,7 +106,7 @@ def compute_metrics(
     logits: JaxArray = apply_fn({"params": params}, x)
     loss: JaxScalar = optax.softmax_cross_entropy_with_integer_labels(logits, y).mean()
     accuracy: JaxScalar = (jnp.argmax(logits, axis=-1) == y).mean()
-    return loss, accuracy
+    return loss.astype(jnp.float32), accuracy.astype(jnp.float32)
 
 
 @functools.partial(jax.jit, donate_argnums=(0,))
@@ -130,7 +130,7 @@ def train_step(
     return next_state, loss, accuracy
 
 
-def jit_eval_step(apply_fn) -> Callable:
+def jit_eval_step(apply_fn: ApplyFn) -> Callable:
     """Generates the evaluation function."""
 
     @jax.jit
@@ -250,12 +250,11 @@ def main(configuration: Configuration) -> None:
     test_dataset: IterableDataset = load_iterable_mnist("test")
 
     for epoch in range(start_epoch, configuration.epochs):
-        key, data_key = jax.random.split(key)
-
+        epoch_key = jax.random.fold_in(key, epoch)
         train_iter = make_huggingface_iterator(
             dataset=train_dataset,
             shuffle=True,
-            data_key=data_key,
+            data_key=epoch_key,
             batch_size=configuration.batch_size,
             shuffle_buffer_size=configuration.shuffle_buffer_size,
         )

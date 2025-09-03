@@ -59,7 +59,7 @@ def prefetch(batches: Iterator[T], size: int = 2, timeout: float = 5.0) -> Itera
             yield cast(T, item)
     finally:
         thread_done.set()
-        thread.join(timeout=timeout)
+        thread.join()  # blocking (no timeout)
 
 
 def make_huggingface_iterator(
@@ -98,7 +98,8 @@ def make_huggingface_iterator(
             "label": np.array(batch["label"], dtype=LabelDType),
         }
 
-    # Apply preprocessing and set the format to "jax"
+    # Apply preprocessing; using fomat "numpy" (and later converting)
+    # appears to be more efficient than using format "jax" directly(?)
     dataset = dataset.map(
         preprocess,
         batched=True,
