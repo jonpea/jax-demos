@@ -1,31 +1,30 @@
 import argparse
 import functools
 import logging
+import itertools
 import shutil
 import sys
 
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Callable, Final, Iterator
+from typing import Any, Callable, Final, Iterable, Iterator, TypeVar
 
 import flax.linen as nn
 import jax
 import jax.numpy as jnp
+import numpy as np
 import optax
 import orbax.checkpoint as ocp
 
 from datasets import (
     DatasetBuilder,
     DatasetInfo,
-    Image,
     load_dataset,
+    load_dataset_builder,
     IterableDataset,
     IterableDatasetDict,
 )
-
-# from flax import jax_utils
-# from flax.training import common_utils
-from flax.training import train_state
+from flax.training.train_state import TrainState
 
 from custom_types import (
     ApplyFn,
@@ -34,9 +33,9 @@ from custom_types import (
     JaxScalar,
     Metrics,
     PyTree,
-    Split,
+    RawExample,
 )
-from data_utilities import RunningMetrics, prefetch, make_huggingface_iterator
+from data_utilities import RunningMetrics, make_huggingface_iterator, peek, prefetch
 
 
 # Setup logging
@@ -85,69 +84,11 @@ class Configuration:
 _DEFAULTS: Final = Configuration()
 
 
-def load_iterable(path: str, split: Split) -> IterableDataset:
-    """Return an IterableDataset for the given split, with streaming enabled."""
-    out = load_dataset(path, split=split, streaming=True)
-    if isinstance(out, IterableDatasetDict):
-        out = out[split]
-    assert isinstance(out, IterableDataset)
-    return out
-
-
-
-@dataclass(frozen=True, slots=True)
-class ImageDataset:
-    name: str
-    num_examples: int
-    iterator: Iterator | None
-
-@dataclass(frozen=True, slots=True)
-class ImageDatasets:
-    size: tuple[int, ...]
-    training: ImageDataset
-    testing: ImageDataset
-    validation: ImageDataset
-
-
-def load_huggingface(path: str) -> IterableDataset:
-    """Return an IterableDataset for the given split, with streaming enabled."""
-    builder: DatasetBuilder = load_dataset_builder(path)
-    info: DatasetInfo = builder.info
-    #
-    # DatasetInfo(
-    #     features={
-    #         'image': Image(mode=None, decode=True), 
-    #         'label': ClassLabel(names=['0', '1', '2', '3', '4', '5', '6', '7', '8', '9'])
-    #     }, 
-    #     dataset_name='mnist', 
-    #     splits={
-    #         'train': SplitInfo(
-    #             name='train', 
-    #             num_bytes=17478900, 
-    #             num_examples=60000, 
-    #             shard_lengths=None, 
-    #             dataset_name='mnist'
-    #         ), 
-    #         'test': SplitInfo(
-    #             name='test', 
-    #             num_bytes=2917782, 
-    #             num_examples=10000, 
-    #             shard_lengths=None, 
-    #             dataset_name='mnist'
-    #         )
-    #     }, 
-    # )
-    #
-    out: IterableDatasetDict = load_dataset(path=path, streaming=True)
-    assert isinstance(out, IterableDatasetDict)
-    return out
-
-
 class MLP(nn.Module):
     """Multi-layer perceptron approximation architecture."""
 
-    hidden_dim: int = 256
-    num_classes: int = 10
+    hidden_dim: int
+    num_classes: int
 
     @nn.compact
     def __call__(self, x: JaxArray) -> JaxArray:
@@ -167,8 +108,8 @@ def compute_metrics(
 
 @functools.partial(jax.jit, donate_argnums=(0,))
 def train_step(
-    state: train_state.TrainState, x: JaxArray, y: JaxArray
-) -> tuple[train_state.TrainState, JaxScalar, JaxScalar]:
+    state: TrainState, x: JaxArray, y: JaxArray
+) -> tuple[TrainState, JaxScalar, JaxScalar]:
     """Evaluates training loss function and accuracy."""
 
     def _compute_metrics(params: PyTree) -> Metrics:
@@ -182,7 +123,7 @@ def train_step(
         _compute_metrics,
         has_aux=True,
     )(state.params)
-    next_state: train_state.TrainState = state.apply_gradients(grads=grads)
+    next_state: TrainState = state.apply_gradients(grads=grads)
     return next_state, loss, accuracy
 
 
@@ -197,9 +138,9 @@ def jit_eval_step(apply_fn: ApplyFn) -> Callable:
 
 
 def train_epoch(
-    state: train_state.TrainState,
+    state: TrainState,
     batches: Iterator[BatchedExamples],
-) -> tuple[train_state.TrainState, RunningMetrics]:
+) -> tuple[TrainState, RunningMetrics]:
     metrics = RunningMetrics()
     for xb, yb in batches:
         state, loss, accuracy = train_step(state, xb, yb)
@@ -208,7 +149,7 @@ def train_epoch(
 
 
 def evaluate(
-    state: train_state.TrainState,
+    state: TrainState,
     batches: Iterator[BatchedExamples],
 ) -> RunningMetrics:
     metrics = RunningMetrics()
@@ -256,9 +197,20 @@ def main(configuration: Configuration) -> None:
         options=ocp.CheckpointManagerOptions(max_to_keep=1, create=True),
     )
 
-    train_dataset: IterableDataset = load_iterable(path="mnist", split="train")
-    test_dataset: IterableDataset = load_iterable(path="mnist", split="test")
-    train_ds_size = 60_000
+    path: Final = "mnist"
+    datasets = load_dataset(path=path, streaming=True)
+    assert isinstance(datasets, IterableDatasetDict)
+    train_dataset: IterableDataset = datasets["train"]
+    test_dataset: IterableDataset = datasets["test"]
+
+    builder: DatasetBuilder = load_dataset_builder(path=path)
+    info: DatasetInfo = builder.info
+    num_classes: int = len(info.features["label"].names)
+    train_ds_size: int = info.splits["train"].num_examples
+
+    example: RawExample = peek(train_dataset)
+    num_pixels: int = int(np.prod(example["image"].size))
+
     steps_per_epoch = train_ds_size // configuration.batch_size
     num_training_steps = steps_per_epoch * configuration.epochs
 
@@ -267,9 +219,9 @@ def main(configuration: Configuration) -> None:
         decay_steps=num_training_steps,
     )
 
-    model = MLP()
-    initial_variables = model.init(key, jnp.ones((1, 784), jnp.float32))
-    initial_state = train_state.TrainState.create(
+    model = MLP(hidden_dim=256, num_classes=num_classes)
+    initial_variables = model.init(key, jnp.ones((1, num_pixels), jnp.float32))
+    initial_state = TrainState.create(
         apply_fn=model.apply,
         params=initial_variables["params"],
         tx=optax.adam(scheduler),
@@ -304,6 +256,7 @@ def main(configuration: Configuration) -> None:
     patience_counter = restored_checkpoint.get("patience", 0)
     start_epoch = restored_checkpoint.get("epoch", 0) + 1
 
+    epoch: int | None = None
     for epoch in range(start_epoch, configuration.epochs):
         epoch_key = jax.random.fold_in(key, epoch)
         train_iter = make_huggingface_iterator(
@@ -371,15 +324,16 @@ def main(configuration: Configuration) -> None:
 
     else:
         # This block runs only if the for loop completes without a `break`
-        final_checkpoint = {
-            "state": state,
-            "best_loss": best_loss,
-            "final_epoch": epoch,
-            "config": configuration.serialization_workaround(),
-        }
-        final_checkpoint_manager.save(
-            epoch, args=ocp.args.StandardSave(final_checkpoint)
-        )
+        if epoch is not None:
+            final_checkpoint: dict[str, Any] = {
+                "state": state,
+                "best_loss": best_loss,
+                "final_epoch": epoch,
+                "config": configuration.serialization_workaround(),
+            }
+            final_checkpoint_manager.save(
+                epoch, args=ocp.args.StandardSave(final_checkpoint)
+            )
 
     logger.info(f"Training completed. Best test loss: {best_loss:.4f}")
 

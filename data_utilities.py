@@ -11,11 +11,12 @@ from numpy.typing import NDArray
 
 from custom_types import (
     BatchedExamples,
-    RawBatch,
-    JaxArray,
-    PreprocessedBatch,
     ImageDType,
+    JaxArray,
     LabelDType,
+    PreprocessedBatch,
+    RawBatch,
+    RawExample,
 )
 
 
@@ -121,6 +122,7 @@ def make_huggingface_iterator(
 
     return
 
+
 @dataclass
 class RunningAverage:
     """Maintains a running average."""
@@ -145,3 +147,11 @@ class RunningMetrics:
     def update(self, loss, accuracy, batch_size: int) -> None:
         self.loss.update(float(loss), batch_size)
         self.accuracy.update(float(accuracy), batch_size)
+
+
+def peek(dataset: IterableDataset) -> RawExample:
+    """Peeks the first value in the lazy dataset."""
+    # "creates a *new IterableDataset* with only the first n elements"
+    # https://huggingface.co/docs/datasets/v4.0.0/en/package_reference/main_classes#datasets.IterableDataset.take
+    first = next(iter(dataset.take(1)))
+    return cast(RawExample, first)

@@ -22,6 +22,12 @@ class ApplyFn(Protocol):
     def __call__(self, vars: PyTree, x: JaxArray) -> JaxArray: ...
 
 
+class RawExample(TypedDict):
+    """Raw labeled data (examples)."""
+
+    image: Image
+    label: int
+
 class RawBatch(TypedDict):
     """Raw labeled data (examples)."""
 
