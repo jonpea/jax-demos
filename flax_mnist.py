@@ -78,9 +78,9 @@ class Configuration:
 _DEFAULTS: Final = Configuration()
 
 
-def load_iterable_mnist(split: Split) -> IterableDataset:
+def load_iterable(path: str, split: Split) -> IterableDataset:
     """Return an IterableDataset for the given split, with streaming enabled."""
-    out = load_dataset("mnist", split=split, streaming=True)
+    out = load_dataset(path, split=split, streaming=True)
     if isinstance(out, IterableDatasetDict):
         out = out[split]
     assert isinstance(out, IterableDataset)
@@ -200,6 +200,8 @@ def main(configuration: Configuration) -> None:
         options=ocp.CheckpointManagerOptions(max_to_keep=1, create=True),
     )
 
+    train_dataset: IterableDataset = load_iterable(path="mnist", split="train")
+    test_dataset: IterableDataset = load_iterable(path="mnist", split="test")
     train_ds_size = 60_000
     steps_per_epoch = train_ds_size // configuration.batch_size
     num_training_steps = steps_per_epoch * configuration.epochs
@@ -245,9 +247,6 @@ def main(configuration: Configuration) -> None:
     best_loss = restored_checkpoint.get("best_loss", float("inf"))
     patience_counter = restored_checkpoint.get("patience", 0)
     start_epoch = restored_checkpoint.get("epoch", 0) + 1
-
-    train_dataset: IterableDataset = load_iterable_mnist("train")
-    test_dataset: IterableDataset = load_iterable_mnist("test")
 
     for epoch in range(start_epoch, configuration.epochs):
         epoch_key = jax.random.fold_in(key, epoch)
