@@ -14,7 +14,14 @@ import jax.numpy as jnp
 import optax
 import orbax.checkpoint as ocp
 
-from datasets import load_dataset, IterableDataset, IterableDatasetDict
+from datasets import (
+    DatasetBuilder,
+    DatasetInfo,
+    Image,
+    load_dataset,
+    IterableDataset,
+    IterableDatasetDict,
+)
 
 # from flax import jax_utils
 # from flax.training import common_utils
@@ -84,6 +91,55 @@ def load_iterable(path: str, split: Split) -> IterableDataset:
     if isinstance(out, IterableDatasetDict):
         out = out[split]
     assert isinstance(out, IterableDataset)
+    return out
+
+
+
+@dataclass(frozen=True, slots=True)
+class ImageDataset:
+    name: str
+    num_examples: int
+    iterator: Iterator | None
+
+@dataclass(frozen=True, slots=True)
+class ImageDatasets:
+    size: tuple[int, ...]
+    training: ImageDataset
+    testing: ImageDataset
+    validation: ImageDataset
+
+
+def load_huggingface(path: str) -> IterableDataset:
+    """Return an IterableDataset for the given split, with streaming enabled."""
+    builder: DatasetBuilder = load_dataset_builder(path)
+    info: DatasetInfo = builder.info
+    #
+    # DatasetInfo(
+    #     features={
+    #         'image': Image(mode=None, decode=True), 
+    #         'label': ClassLabel(names=['0', '1', '2', '3', '4', '5', '6', '7', '8', '9'])
+    #     }, 
+    #     dataset_name='mnist', 
+    #     splits={
+    #         'train': SplitInfo(
+    #             name='train', 
+    #             num_bytes=17478900, 
+    #             num_examples=60000, 
+    #             shard_lengths=None, 
+    #             dataset_name='mnist'
+    #         ), 
+    #         'test': SplitInfo(
+    #             name='test', 
+    #             num_bytes=2917782, 
+    #             num_examples=10000, 
+    #             shard_lengths=None, 
+    #             dataset_name='mnist'
+    #         )
+    #     }, 
+    # )
+    #
+    out: IterableDatasetDict = load_dataset(path=path, streaming=True)
+    assert isinstance(out, IterableDatasetDict)
     return out
 
 

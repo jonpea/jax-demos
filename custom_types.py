@@ -1,3 +1,4 @@
+import enum
 from typing import Any, Literal, Protocol, TypeAlias, TypedDict
 
 import jax
@@ -33,3 +34,11 @@ class PreprocessedBatch(TypedDict):
 
     image: NDArray[ImageDType]
     label: NDArray[LabelDType]
+
+
+class Splits(enum.Enum):
+    """Dataset splits associated with Hugging Face string literals."""
+
+    TRAINING = "train"
+    TESTING = "test"
+    VALIDATION = "validation"

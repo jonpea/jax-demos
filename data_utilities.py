@@ -86,15 +86,21 @@ def make_huggingface_iterator(
             seed=huggingface_seed, buffer_size=shuffle_buffer_size
         )
 
+    num_examples_counter: int = 0
+
     def preprocess(batch: RawBatch) -> PreprocessedBatch:
         """Vectorized preprocessing for a batch of images and labels."""
         # fmt: off
         raw_images = np.stack([np.array(img) for img in batch["image"]])
         scale: ImageDType = ImageDType(2 / np.iinfo(raw_images.dtype).max)
         images: NDArray[ImageDType] = raw_images.astype(ImageDType) * scale - ImageDType(1)
+        this_batch_size = images.shape[0]
+        nonlocal num_examples_counter
+        num_examples_counter += this_batch_size
+        assert 0 < this_batch_size <= batch_size  # final batch might be smaller
         # fmt: on
         return {
-            "image": images.reshape(images.shape[0], -1),
+            "image": images.reshape(this_batch_size, -1),
             "label": np.array(batch["label"], dtype=LabelDType),
         }
 
@@ -106,11 +112,14 @@ def make_huggingface_iterator(
         batch_size=batch_size,
     ).with_format("numpy")
 
-    for batch in dataset.iter(batch_size=batch_size):
+    for i, batch in enumerate(dataset.iter(batch_size=batch_size)):
         xb = jnp.asarray(batch["image"], dtype=jnp.float32)
         yb = jnp.asarray(batch["label"], dtype=jnp.int32)
         yield (xb, yb)
+    else:
+        assert i == num_examples_counter // batch_size
 
+    return
 
 @dataclass
 class RunningAverage:
