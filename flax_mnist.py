@@ -1,13 +1,12 @@
 import argparse
 import functools
 import logging
-import itertools
 import shutil
 import sys
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Final, Iterable, Iterator, TypeVar
+from typing import Any, Callable, Final, Iterator
 
 import flax.linen as nn
 import jax
@@ -61,6 +60,7 @@ class Configuration:
     early_stopping_patience: int = 3
     epochs: int = 5
     eval_every_n_epochs: int = 1
+    hidden_dims: list[int] = field(default_factory=lambda:[256])
     learning_rate: float = 1e-3
     prefetch: int = 2
     seed: int = 0
@@ -69,6 +69,8 @@ class Configuration:
     def __post_init__(self):
         assert self.batch_size > 0
         assert self.epochs > 0
+        assert len(self.hidden_dims) > 0
+        assert min(self.hidden_dims) > 0
         assert self.learning_rate > 0
         assert self.prefetch >= 0
         assert self.eval_every_n_epochs > 0
@@ -87,14 +89,14 @@ _DEFAULTS: Final = Configuration()
 class MLP(nn.Module):
     """Multi-layer perceptron approximation architecture."""
 
-    hidden_dim: int
+    hidden_dims: list[int]
     num_classes: int
 
     @nn.compact
     def __call__(self, x: JaxArray) -> JaxArray:
-        x = nn.relu(nn.Dense(self.hidden_dim)(x))
-        x = nn.Dense(self.num_classes)(x)
-        return x
+        for dim in self.hidden_dims:
+            x = nn.relu(nn.Dense(dim)(x))
+        return nn.Dense(self.num_classes)(x)
 
 
 def compute_metrics(
@@ -219,7 +221,7 @@ def main(configuration: Configuration) -> None:
         decay_steps=num_training_steps,
     )
 
-    model = MLP(hidden_dim=256, num_classes=num_classes)
+    model = MLP(hidden_dims=configuration.hidden_dims, num_classes=num_classes)
     initial_variables = model.init(key, jnp.ones((1, num_pixels), jnp.float32))
     initial_state = TrainState.create(
         apply_fn=model.apply,
@@ -378,6 +380,14 @@ def parse_args() -> Configuration:
         "--eval-every-n-epochs",
         default=_DEFAULTS.eval_every_n_epochs,
         help="Evaluation frequency",
+        type=int,
+    )
+    parser.add_argument(
+        "--hidden-dims",
+        default=_DEFAULTS.hidden_dims,
+        help="Dimensions of hidden layers",
+        metavar="DIM",
+        nargs="+",
         type=int,
     )
     parser.add_argument(
