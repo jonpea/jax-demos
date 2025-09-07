@@ -24,7 +24,7 @@ T = TypeVar("T")
 _SENTINEL: Final = object()
 
 
-def prefetch(batches: Iterator[T], size: int = 2, timeout: float = 10.0) -> Iterator[T]:
+def prefetch(batches: Iterator[T], size: int = 2, timeout: float = 30.0) -> Iterator[T]:
     """Prefetch a few batches to device on a background thread."""
 
     if size <= 0:

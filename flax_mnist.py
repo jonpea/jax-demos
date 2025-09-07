@@ -6,7 +6,7 @@ import sys
 
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Final, Iterator
+from typing import Any, Callable, Final, Iterator, cast
 
 import flax.linen as nn
 import jax
@@ -15,6 +15,7 @@ import numpy as np
 import optax
 import orbax.checkpoint as ocp
 
+from clu import metric_writers
 from datasets import (
     DatasetBuilder,
     DatasetInfo,
@@ -60,8 +61,9 @@ class Configuration:
     early_stopping_patience: int = 3
     epochs: int = 5
     eval_every_n_epochs: int = 1
-    hidden_dims: list[int] = field(default_factory=lambda:[256])
+    hidden_dims: list[int] = field(default_factory=lambda: [256])
     learning_rate: float = 1e-3
+    logs_dir: Path = Path("./logs")
     prefetch: int = 2
     seed: int = 0
     shuffle_buffer_size: int = 50_000
@@ -80,6 +82,7 @@ class Configuration:
         """orbax-serialization doesn't support pathlib.Path or even str(?)"""
         d = asdict(self)
         d.pop("checkpoints_dir")
+        d.pop("logs_dir")
         return d
 
 
@@ -167,18 +170,24 @@ def main(configuration: Configuration) -> None:
 
     # Prepare checkpointing
     checkpoints_dir: Path = configuration.checkpoints_dir.resolve()
-
     if configuration.clean_start and checkpoints_dir.exists():
         shutil.rmtree(checkpoints_dir)
         logger.info("Starting from scratch - existing checkpoints removed")
-
     checkpoints_dir.mkdir(exist_ok=True, parents=True)
     final_checkpoints_dir: Path = checkpoints_dir / "final"
     final_checkpoints_dir.mkdir(exist_ok=True)
 
+    # Prepare TensorBoard-based logging
+    writer = metric_writers.create_default_writer(
+        logdir=configuration.logs_dir,
+        just_logging=False,
+    )
+
     key = jax.random.PRNGKey(configuration.seed)
 
-    logger.info(f"Using {jax.device_count()} device(s): {jax.devices()}")
+    logger.info("Using %d device(s):", jax.device_count())
+    for i, device in enumerate(jax.devices()):
+        logger.info("  Device %d: %s (platform: %s)", i, device, device.platform)
     logger.info(
         "Config | seed=%d batch=%d epochs=%d lr=%.2e prefetch=%d buffer=%d",
         configuration.seed,
@@ -206,7 +215,7 @@ def main(configuration: Configuration) -> None:
     test_dataset: IterableDataset = datasets["test"]
 
     builder: DatasetBuilder = load_dataset_builder(path=path)
-    info: DatasetInfo = builder.info
+    info: DatasetInfo = cast(DatasetInfo, builder.info)
     num_classes: int = len(info.features["label"].names)
     train_ds_size: int = info.splits["train"].num_examples
 
@@ -216,17 +225,19 @@ def main(configuration: Configuration) -> None:
     steps_per_epoch = train_ds_size // configuration.batch_size
     num_training_steps = steps_per_epoch * configuration.epochs
 
-    scheduler = optax.cosine_decay_schedule(
+    learning_rate_schedule: Callable = optax.cosine_decay_schedule(
         init_value=configuration.learning_rate,
         decay_steps=num_training_steps,
     )
 
     model = MLP(hidden_dims=configuration.hidden_dims, num_classes=num_classes)
-    initial_variables = model.init(key, jnp.ones((1, num_pixels), jnp.float32))
-    initial_state = TrainState.create(
+    initial_variables: dict[str, Any] = model.init(
+        key, jnp.ones((1, num_pixels), jnp.float32)
+    )
+    initial_state: TrainState = TrainState.create(
         apply_fn=model.apply,
         params=initial_variables["params"],
-        tx=optax.adam(scheduler),
+        tx=optax.adam(learning_rate=learning_rate_schedule),
     )
 
     # Define a default checkpoint structure
@@ -238,9 +249,9 @@ def main(configuration: Configuration) -> None:
     }
 
     # Manual check for checkpoint existence to work around the Orbax bug
-    latest_step = checkpoints_manager.latest_step()
+    latest_step: int | None = checkpoints_manager.latest_step()
     if latest_step is not None:
-        logger.info(f"Restoring from checkpoint at step {latest_step}")
+        logger.info("Restoring from checkpoint at step %d", latest_step)
         restored_checkpoint = checkpoints_manager.restore(
             step=latest_step,
             args=ocp.args.StandardRestore(default_checkpoint),
@@ -253,18 +264,17 @@ def main(configuration: Configuration) -> None:
     if not isinstance(restored_checkpoint, dict):
         raise TypeError("Expected restored checkpoint to be a dictionary.")
 
-    state = restored_checkpoint["state"]
-    best_loss = restored_checkpoint.get("best_loss", float("inf"))
-    patience_counter = restored_checkpoint.get("patience", 0)
-    start_epoch = restored_checkpoint.get("epoch", 0) + 1
+    state: TrainState = restored_checkpoint["state"]
+    best_loss: float = restored_checkpoint.get("best_loss", float("inf"))
+    patience_counter: int = restored_checkpoint.get("patience", 0)
+    start_epoch: int = restored_checkpoint.get("epoch", 0) + 1
 
     epoch: int | None = None
     for epoch in range(start_epoch, configuration.epochs):
-        epoch_key = jax.random.fold_in(key, epoch)
-        train_iter = make_huggingface_iterator(
+        train_iter: Iterator[BatchedExamples] = make_huggingface_iterator(
             dataset=train_dataset,
             shuffle=True,
-            data_key=epoch_key,
+            data_key=jax.random.fold_in(key, epoch),
             batch_size=configuration.batch_size,
             shuffle_buffer_size=configuration.shuffle_buffer_size,
         )
@@ -273,12 +283,22 @@ def main(configuration: Configuration) -> None:
         #     train_iter, size=configuration.prefetch
         # )
 
-        state, train_metrics = train_epoch(state, train_iter_prefetched)
-        train_loss = train_metrics.loss.mean
-        train_accuracy = train_metrics.accuracy.mean
+        state: TrainState
+        metrics: RunningMetrics
+        state, metrics = train_epoch(state, train_iter_prefetched)
+        train_loss: float = metrics.loss.mean
+        train_accuracy: float = metrics.accuracy.mean
+
+        writer.write_scalars(
+            step=epoch,
+            scalars={
+                "train/loss": float(train_loss),
+                "train/accuracy": float(train_accuracy),
+            },
+        )
 
         if epoch % configuration.eval_every_n_epochs == 0:
-            eval_iter = make_huggingface_iterator(
+            eval_iter: Iterator[BatchedExamples] = make_huggingface_iterator(
                 dataset=test_dataset,
                 shuffle=False,
                 batch_size=configuration.batch_size,
@@ -288,14 +308,25 @@ def main(configuration: Configuration) -> None:
             #     eval_iter, size=configuration.prefetch
             # )
 
-            eval_metrics = evaluate(state, eval_iter_prefetched)
-            eval_loss = eval_metrics.loss.mean
-            eval_accuracy = eval_metrics.accuracy.mean
+            eval_metrics: RunningMetrics = evaluate(state, eval_iter_prefetched)
+            eval_loss: float = eval_metrics.loss.mean
+            eval_accuracy: float = eval_metrics.accuracy.mean
+
+            writer.write_scalars(
+                step=epoch,
+                scalars={
+                    "eval/loss": float(eval_loss),
+                    "eval/accuracy": float(eval_accuracy),
+                },
+            )
 
             logger.info(
-                f"[Flax] epoch {epoch} "
-                f"loss={train_loss:.4f} accuracy={train_accuracy:.3f} "
-                f"test_loss={eval_loss:.4f} test_accuracy={eval_accuracy:.3f}"
+                "[Flax] epoch %d loss=%.4f accuracy=%.3f test_loss=%.4f test_accuracy=%.3f",
+                epoch,
+                train_loss,
+                train_accuracy,
+                eval_loss,
+                eval_accuracy,
             )
 
             if eval_loss < best_loss:
@@ -337,6 +368,7 @@ def main(configuration: Configuration) -> None:
                 epoch, args=ocp.args.StandardSave(final_checkpoint)
             )
 
+    writer.flush()
     logger.info(f"Training completed. Best test loss: {best_loss:.4f}")
 
 
@@ -397,6 +429,12 @@ def parse_args() -> Configuration:
         type=float,
     )
     parser.add_argument(
+        "--logs-dir",
+        default=_DEFAULTS.logs_dir,
+        help="Directory to save log files",
+        type=Path,
+    )
+    parser.add_argument(
         "--prefetch",
         default=_DEFAULTS.prefetch,
         help="Number of batches to prefetch",
@@ -419,15 +457,9 @@ def parse_args() -> Configuration:
     return Configuration(**vars(args))
 
 
-def cleanup():
-    """Releases resources."""
-    jax.clear_caches()
-    # jax.clear_backends() was removed in JAX v0.4.36
-
-
 if __name__ == "__main__":
     config = parse_args()
     try:
         main(config)
     finally:
-        cleanup()
+        jax.clear_caches()

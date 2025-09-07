@@ -1,3 +1,4 @@
+clu
 datasets[vision]
 equinox
 ipython
@@ -8,3 +9,4 @@ orbax-checkpoint==0.5.3
 pillow
 pytest
 ruff
+tensorflow-cpu>=2.15,<2.18
